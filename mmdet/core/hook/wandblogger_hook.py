@@ -10,11 +10,11 @@ from mmdet.core import DistEvalHook, EvalHook
 
 
 @HOOKS.register_module()
-class WandbLogger(WandbLoggerHook):
-    """WandbLogger logs metrics, saves model checkpoints as W&B Artifact, and
-    logs model prediction as interactive W&B Tables.
+class MMDetWandbHook(WandbLoggerHook):
+    """MMDetWandbHook logs metrics, saves model checkpoints as W&B Artifact,
+    and logs model prediction as interactive W&B Tables.
 
-    - Metrics: The WandbLogger will automatically log training
+    - Metrics: The MMDetWandbHook will automatically log training
         and validation metrics.
 
     - Checkpointing: If `log_checkpoint` is True, the checkpoint saved at
@@ -22,7 +22,7 @@ class WandbLogger(WandbLoggerHook):
         Please refer to https://docs.wandb.ai/guides/artifacts/model-versioning
         to learn more about model versioning with W&B Artifacts.
         Note: This depends on the `CheckpointHook` whose priority is more
-        than `WandbLogger`.
+        than `MMDetWandbHook`.
 
     - Checkpoint Metadata: If `log_checkpoint_metadata` is True, every
         checkpoint artifact will have a metadata associated with it.
@@ -31,16 +31,17 @@ class WandbLogger(WandbLoggerHook):
         also marks the checkpoint version with the best evaluation metric with
         a 'best' alias. You can choose the best checkpoint in the W&B Artifacts
         UI using this.
-        Note: It depends on `EvalHook` whose priority is more than WandbLogger.
+        Note: It depends on `EvalHook` whose priority is more
+        than MMDetWandbHook.
 
-    - Evaluation: At every evaluation interval, the `WandbLogger` logs the
+    - Evaluation: At every evaluation interval, the `MMDetWandbHook` logs the
         model prediction as interactive W&B Tables. The number of samples
         logged is given by `num_eval_images`. Please refer to
         https://docs.wandb.ai/guides/data-vis to learn more about W&B Tables.
-        Currently, the `WandbLogger` logs the predicted bounding boxes along
+        Currently, the `MMDetWandbHook` logs the predicted bounding boxes along
         with the ground truth at every evaluation interval.
         Note: This depends on the `EvalHook` whose priority is more than
-        `WandbLogger`. Also note that the data is just logged once and
+        `MMDetWandbHook`. Also note that the data is just logged once and
         subsequent evaluation tables uses reference to the logged data to save
         memory usage.
 
@@ -49,12 +50,12 @@ class WandbLogger(WandbLoggerHook):
         log_config = dict(
             interval=10,
             hooks=[
-                dict(type='WandbLogger',
-                     wandb_init_kwargs={
+                dict(type='MMDetWandbHook',
+                     init_kwargs={
                          'entity': WANDB_ENTITY,
                          'project': WANDB_PROJECT_NAME
                      },
-                     logging_interval=10,
+                     interval=10,
                      log_checkpoint=True,
                      log_checkpoint_metadata=True,
                      num_eval_images=100)
@@ -62,10 +63,10 @@ class WandbLogger(WandbLoggerHook):
     ```
 
     Args:
-        wandb_init_kwargs (dict): A dict passed to wandb.init to initialize
+        init_kwargs (dict): A dict passed to wandb.init to initialize
             a W&B run. Please refer to https://docs.wandb.ai/ref/python/init
             for possible key-value pairs.
-        logging_interval (int): Logging interval (every k iterations).
+        interval (int): Logging interval (every k iterations).
             Default 10.
         log_checkpoint (bool): Save the checkpoint at every checkpoint interval
             as W&B Artifacts. Use this for model versioning where each version
@@ -80,31 +81,31 @@ class WandbLogger(WandbLoggerHook):
     """
 
     def __init__(self,
-                 wandb_init_kwargs=None,
+                 init_kwargs=None,
                  interval=10,
                  log_checkpoint=False,
                  log_checkpoint_metadata=False,
                  num_eval_images=100,
                  **kwargs):
-        super(WandbLogger, self).__init__(wandb_init_kwargs, interval,
-                                          **kwargs)
+        super(MMDetWandbHook, self).__init__(init_kwargs, interval, **kwargs)
 
         self.log_checkpoint = log_checkpoint
         self.log_checkpoint_metadata = log_checkpoint_metadata
         self.num_eval_images = num_eval_images
+        self.log_evaluation = True
         self.log_eval_metrics = True
         self.best_score = 0
         self.val_step = 0
 
     @master_only
     def before_run(self, runner):
-        super(WandbLogger, self).before_run(runner)
+        super(MMDetWandbHook, self).before_run(runner)
         self.cfg = self.wandb.config
         # Check if configuration is passed to wandb.
         if len(dict(self.cfg)) == 0:
             warnings.warn(
                 'To log mmdetection Config, '
-                'pass it to init_kwargs of WandbLogger.', UserWarning)
+                'pass it to init_kwargs of MMDetWandbHook.', UserWarning)
 
         # Check if EvalHook and CheckpointHook are available.
         for hook in runner.hooks:
@@ -114,9 +115,7 @@ class WandbLogger(WandbLoggerHook):
                 self.eval_hook = hook
 
         # If CheckpointHook is not available turn off log_checkpoint.
-        try:
-            self._check_priority(self.ckpt_hook)
-        except AttributeError:
+        if getattr(self, 'ckpt_hook', None) is None:
             self.log_checkpoint = False
             warnings.warn('To use log_checkpoint turn use '
                           'CheckpointHook.', UserWarning)
@@ -126,7 +125,6 @@ class WandbLogger(WandbLoggerHook):
         try:
             self.val_dataloader = self.eval_hook.dataloader
             self.val_dataset = self.val_dataloader.dataset
-            self._check_priority(self.eval_hook)
         except AttributeError:
             self.num_eval_images = 0
             self.log_checkpoint_metadata = False
@@ -143,7 +141,8 @@ class WandbLogger(WandbLoggerHook):
             # Add data to the table
             self._add_ground_truth()
             # Log ground truth data
-            self._log_data_table()
+            if self.log_evaluation:
+                self._log_data_table()
 
         # Define a custom x-axes for validation metrics.
         if self.log_eval_metrics:
@@ -185,47 +184,20 @@ class WandbLogger(WandbLoggerHook):
                         self._log_ckpt_as_artifact(self.ckpt_hook.out_dir,
                                                    runner.epoch, aliases)
 
-        if self.num_eval_images > 0:
-            if self.eval_hook.by_epoch:
-                if self.every_n_epochs(
-                        runner,
-                        self.eval_hook.interval) or self.is_last_epoch(runner):
-                    results = self.eval_hook.results
-                    # Initialize evaluation table
-                    self._init_pred_table()
-                    # Log predictions
-                    self._log_predictions(results, runner.epoch + 1)
-                    # Log the table
-                    self._log_eval_table()
+        if self.num_eval_images > 0 and self.log_evaluation:
+            if self.eval_hook.by_epoch and self.eval_hook._should_evaluate(
+                    runner):
+                results = self.eval_hook.results
+                # Initialize evaluation table
+                self._init_pred_table()
+                # Log predictions
+                self._log_predictions(results, runner.epoch + 1)
+                # Log the table
+                self._log_eval_table()
 
     @master_only
     def after_run(self, runner):
         self.wandb.finish()
-
-    def _check_priority(self, hook):
-        """Check the if the priority of the hook is more than WandbLogger.
-
-        Note that, a smaller priority will have bigger integer value and vice
-        versa.
-        """
-        if isinstance(hook, CheckpointHook):
-            if self.priority < hook.priority:
-                self.log_checkpoint = False
-                warnings.warn(
-                    'The priority of CheckpointHook should '
-                    'be more than WandbLogger to use log_checkpoint.',
-                    UserWarning)
-        elif isinstance(hook, (EvalHook, DistEvalHook)):
-            if self.priority < hook.priority:
-                self.num_eval_images = 0
-                self.log_checkpoint_metadata = False
-                self.log_eval_metrics = False
-                warnings.warn(
-                    'The priority of EvalHook should be more than '
-                    'WandbLogger to log num_eval_images', UserWarning)
-        else:
-            print(f'The {hook.__name__} doesn\'t belong to CheckpointHook or '
-                  'EvalHook.')
 
     def _log_ckpt_as_artifact(self,
                               path_to_model,
@@ -309,6 +281,19 @@ class WandbLogger(WandbLoggerHook):
         self.eval_table = self.wandb.Table(columns=columns)
 
     def _add_ground_truth(self):
+        # Get image loading pipeline
+        from mmdet.datasets.pipelines import LoadImageFromFile
+        transforms = self.val_dataset.pipeline.transforms
+        for transform in transforms:
+            if isinstance(transform, LoadImageFromFile):
+                img_loader = transform
+        if 'img_loader' not in locals():
+            warnings.warn(
+                'LoadImageFromFile is required to add images '
+                'to W&B Tables.', UserWarning)
+            self.log_evaluation = False
+
+        # Determine the number of samples to be logged.
         num_total_images = len(self.val_dataset)
         if self.num_eval_images > num_total_images:
             warnings.warn(
@@ -324,8 +309,6 @@ class WandbLogger(WandbLoggerHook):
             'name': name
         } for id, name in self.class_id_to_label.items()])
 
-        from mmdet.datasets.pipelines import LoadImageFromFile
-        img_loader = LoadImageFromFile()
         img_prefix = self.val_dataset.img_prefix
 
         for idx in range(self.num_eval_images):
@@ -341,11 +324,8 @@ class WandbLogger(WandbLoggerHook):
             bboxes = data_ann['bboxes']
             labels = data_ann['labels']
 
-            box_data = []
             assert len(bboxes) == len(labels)
-            for bbox, label in zip(bboxes, labels):
-                box_data.append(
-                    self._get_wandb_bbox(bbox, label, classes[label]))
+            box_data = self._get_wandb_bboxes(bboxes, labels, mode='gt')
 
             boxes = {
                 'ground_truth': {
@@ -366,30 +346,21 @@ class WandbLogger(WandbLoggerHook):
             result = results[ndx]
             assert len(result) == len(self.class_id_to_label)
 
-            box_data = []
+            result_box_data = []
             class_scores = []
-            for label_id, bbox_scores in enumerate(result):
-                if len(bbox_scores) != 0:
-                    class_score = 0
-                    count = 0
-                    for bbox_score in bbox_scores:
-                        confidence = float(bbox_score[4])
-                        if confidence > 0.3:
-                            class_score += confidence
-                            count += 1
-                            class_name = self.class_id_to_label[label_id]
-                            box_data.append(
-                                self._get_wandb_bbox(
-                                    bbox_score, label_id,
-                                    f'{class_name} {confidence:.2f}'))
-
+            for label_id, bboxes in enumerate(result):
+                if len(bboxes) != 0:
+                    labels = [label_id] * len(bboxes)
+                    box_data, class_score, count = self._get_wandb_bboxes(
+                        bboxes, labels, mode='pred')
+                    result_box_data.extend(box_data)
                     class_scores.append(class_score / (count + 1e-6))
                 else:
                     class_scores.append(0)
 
             boxes = {
                 'predictions': {
-                    'box_data': box_data,
+                    'box_data': result_box_data,
                     'class_labels': self.class_id_to_label
                 }
             }
@@ -402,38 +373,59 @@ class WandbLogger(WandbLoggerHook):
                     boxes=boxes,
                     classes=self.class_set), *tuple(class_scores))
 
-    def _get_wandb_bbox(self, bbox, label, box_caption):
-        """Get structured dict for logging bounding boxes to W&B.
+    def _get_wandb_bboxes(self, bboxes, labels, mode='gt'):  # pred
+        """Get list of structured dict for logging bounding boxes to W&B.
 
         Args:
-            bbox (list): Bounding box coordinates in
+            bboxes (list): List of bounding box coordinates in
                         (minX, minY, maxX, maxY) format.
-            label (int): label id for that bounding box.
-            box_caption (str): Caption for that bounding box.
-            scale_factor (list): List rescaling factor for bounding box values.
+            labels (int): List of label ids.
+            mode (str): Set it to 'gt' for ground truth and 'pred'
+                for logging prediction results.
 
         Returns:
-            dict: Structured dict required for logging
-                  that bounding box to W&B.
+            List[dict]: List of structured dict required for
+                logging that bounding boxes to W&B.
         """
-        position = dict(
-            minX=int(bbox[0]),
-            minY=int(bbox[1]),
-            maxX=int(bbox[2]),
-            maxY=int(bbox[3]))
+        box_data = []
 
-        if not isinstance(label, int):
-            label = int(label)
+        if mode == 'pred':
+            class_score = 0
+            count = 0
 
-        if not isinstance(box_caption, str):
-            box_caption = str(box_caption)
+        for bbox, label in zip(bboxes, labels):
+            if len(bbox) == 5 and mode == 'pred':
+                confidence = float(bbox[4])
+                if confidence > 0.3:
+                    class_score += confidence
+                    count += 1
+                    class_name = self.class_id_to_label[label]
+                    box_caption = f'{class_name} {confidence:.2f}'
+                else:
+                    continue
+            else:
+                box_caption = str(self.class_id_to_label[label])
 
-        return {
-            'position': position,
-            'class_id': label,
-            'box_caption': box_caption,
-            'domain': 'pixel'
-        }
+            position = dict(
+                minX=int(bbox[0]),
+                minY=int(bbox[1]),
+                maxX=int(bbox[2]),
+                maxY=int(bbox[3]))
+
+            if not isinstance(label, int):
+                label = int(label)
+
+            box_data.append({
+                'position': position,
+                'class_id': label,
+                'box_caption': box_caption,
+                'domain': 'pixel'
+            })
+
+        if len(bboxes[0]) == 5 and mode == 'pred':
+            return box_data, class_score, count
+
+        return box_data
 
     def _log_data_table(self):
         """Log the W&B Tables for validation data as artifact and calls
